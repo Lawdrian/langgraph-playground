@@ -11,46 +11,9 @@ import operator
 
 # Import model factory and tools
 from langchain.chat_models import init_chat_model
-from tools import add, multiply, divide  # keep tools.py as-is
+from tools import add, multiply, divide, check_balance
 
-from agents import make_llm_call
-
-# Prepare tools list and mapping (tools are the decorated tool objects)
-TOOLS = [add, multiply, divide]
-TOOLS_BY_NAME = {t.name: t for t in TOOLS}
-
-
-class MessagesState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
-
-
-def make_tool_node(tools_by_name: Dict[str, Any]):
-    """
-    Return a node function `tool_node(state: dict) -> dict` that performs tool invocation
-    for any tool calls the LLM produced.
-    """
-    def tool_node(state: dict) -> dict:
-        result = []
-        for tool_call in state["messages"][-1].tool_calls:
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
-        return {"messages": result}
-    return tool_node
-
-
-def should_continue(state: MessagesState):
-    """
-    Conditional used by the graph to decide whether to go to `tool_node` or END.
-    Returns "tool_node" when the LLM created tool calls; otherwise returns END.
-    """
-    messages = state["messages"]
-    last_message = messages[-1]
-    
-    if getattr(last_message, "tool_calls", None):
-        return "tool_node"
-    return END
+from agents import make_front_desk_agent, validate_transaction, human_approval_node, execute_transaction
 
 
 def _init_model():
@@ -65,27 +28,128 @@ def _init_model():
         temperature=0
     )
 
+# Prepare tools list and mapping (tools are the decorated tool objects)
+MATH_TOOLS = [add, multiply, divide]
+BANK_TOOLS = [check_balance]  # Only read-only tools for the LLM
+TOOLS_BY_NAME = {t.name: t for t in MATH_TOOLS + BANK_TOOLS}
+
+
+class MessagesState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+    llm_calls: int
+    # Transaction state
+    from_account: str
+    to_account: str
+    amount: float
+    needs_approval: bool
+    approved: bool
+    # Bank database (stored in file)
+    accounts_filepath: str  # Path to JSON file with account balances
+
+
+def make_tool_node(tools_by_name: Dict[str, Any]):
+    """
+    Return a node function `tool_node(state: dict) -> dict` that performs tool invocation
+    for any tool calls the LLM produced.
+    """
+    def tool_node(state: dict) -> dict:
+        result = []
+        for tool_call in state["messages"][-1].tool_calls:
+            tool = tools_by_name[tool_call["name"]]
+            args = tool_call["args"]
+            
+            # Inject accounts_filepath for banking tools
+            if tool_call["name"] == "check_balance" and "accounts_filepath" not in args:
+                args = {**args, "accounts_filepath": state.get("accounts_filepath")}
+            
+            observation = tool.invoke(args)
+            result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
+        return {"messages": result}
+    return tool_node
+
+
+def should_continue(state: MessagesState):
+    """Route based on tool calls or transfer intent"""
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # Check if there are tool calls (getattr returns [] if no tool_calls attribute or empty list)
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if tool_calls:  # This checks if list exists AND is not empty
+        print(f"LLM requested {len(tool_calls)} tool call(s), continuing to tool_node.")
+        return "tool_node"
+    
+    # Check if LLM detected transfer intent and set transaction details
+    if state.get("from_account") and state.get("to_account") and state.get("amount"):
+        print(f"Transfer intent detected: €{state['amount']} from {state['from_account']} to {state['to_account']}")
+        return "validate_transaction"
+    
+    print("No tool calls or transfer intent, ending agent run.")
+    return END
+
+
+def should_require_approval(state: dict) -> str:
+    """Check if approval is needed based on amount in state"""
+    needs_approval = state.get("needs_approval", False)
+    
+    if needs_approval:
+        print(f"⏸️ Routing to human_approval (amount > €100)")
+        return "human_approval"
+    
+    print(f"✓ Auto-approved, routing to execute_transaction")
+    return "execute_transaction"
+
 
 def build_and_compile_agent(checkpointer=None):
-    """
-    Build and compile the agent. If no checkpointer is provided, uses SqliteSaver.
-    Returns (compiled_agent, builder).
-    """
+    """Build graph with HITL nodes"""
     if checkpointer is None:
         checkpointer = InMemorySaver()
 
     model = _init_model()
-    model_with_tools = model.bind_tools(TOOLS)
+    model_with_tools = model.bind_tools(MATH_TOOLS + BANK_TOOLS)
 
-    llm_node = make_llm_call(model_with_tools)
+    llm_node = make_front_desk_agent(model_with_tools)
     tool_node = make_tool_node(TOOLS_BY_NAME)
 
     builder = GraphBuilder(MessagesState, checkpointer=checkpointer)
+    
+    # Add nodes
     builder.add_node("llm_call", llm_node)
     builder.add_node("tool_node", tool_node)
+    builder.add_node("validate_transaction", validate_transaction)
+    builder.add_node("human_approval", human_approval_node)
+    builder.add_node("execute_transaction", execute_transaction)
+    
+    # Flow: llm_call -> check_balance (tool) or validate_transaction (transfer) or END
     builder.add_edge(START, "llm_call")
-    builder.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
-    builder.add_edge("tool_node", "llm_call")
+    builder.add_conditional_edges(
+        "llm_call", 
+        should_continue, 
+        ["tool_node", "validate_transaction", END]
+    )
+    builder.add_edge("tool_node", "llm_call")  # After tool execution, back to LLM
+    
+    # Transaction flow: validate -> (approve?) -> execute -> llm_call (to inform user)
+    builder.add_conditional_edges(
+        "validate_transaction",
+        should_require_approval,
+        ["human_approval", "execute_transaction"]
+    )
+    builder.add_edge("execute_transaction", "llm_call")  # LLM sends confirmation message
+    
+    # After human_approval, check if approved or rejected
+    def after_human_approval(state: dict) -> str:
+        if state.get("approved", False):
+            return "execute_transaction"
+        else:
+            return END  # Rejected - end without executing
+    
+    builder.add_conditional_edges(
+        "human_approval",
+        after_human_approval,
+        ["execute_transaction", END]
+    )
 
-    agent = builder.compile()
+    # Add interrupt BEFORE the human_approval node
+    agent = builder.compile(interrupt_before=["human_approval"])
     return agent, builder

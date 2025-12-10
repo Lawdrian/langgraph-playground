@@ -22,12 +22,12 @@ class GraphBuilder:
         self._graph.add_conditional_edges(src, cond, list(dsts))
 
     # Build/compile
-    def compile(self) -> Any:
+    def compile(self, interrupt_before=None) -> Any:
         """
         Compile the StateGraph and cache the compiled agent.
         Returns the compiled agent.
         """
-        self._agent = self._graph.compile(checkpointer=self._checkpointer)
+        self._agent = self._graph.compile(checkpointer=self._checkpointer, interrupt_before=interrupt_before)
         return self._agent
 
     def get_agent(self) -> Optional[Any]:
